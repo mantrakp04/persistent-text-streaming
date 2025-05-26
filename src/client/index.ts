@@ -25,6 +25,17 @@ export type StreamWriter<A extends GenericActionCtx<GenericDataModel>> = (
   chunkAppender: ChunkAppender
 ) => Promise<void>;
 
+export type ActionStreamWriter<A extends GenericActionCtx<GenericDataModel>> = (
+  ctx: A,
+  streamId: StreamId,
+  chunkAppender: ChunkAppender
+) => Promise<void>;
+
+export type GetStreamOptions = {
+  pollInterval?: number; // milliseconds, default 1000
+  timeout?: number; // milliseconds, default 30000
+};
+
 // TODO -- make more flexible. # of bytes, etc?
 const hasDelimeter = (text: string) => {
   return text.includes(".") || text.includes("!") || text.includes("?");
@@ -105,7 +116,7 @@ export class PersistentTextStreaming {
    * });
    * ```
    */
-  async stream<A extends GenericActionCtx<GenericDataModel>>(
+  async httpStream<A extends GenericActionCtx<GenericDataModel>>(
     ctx: A,
     request: Request,
     streamId: StreamId,
@@ -168,6 +179,104 @@ export class PersistentTextStreaming {
 
     // Send the readable back to the browser
     return new Response(readable);
+  }
+
+  /**
+   * Stream data to the database without returning HTTP chunks. This is useful
+   * for background processing where you want to persist the stream but don't
+   * need to stream the response back to a client.
+   *
+   * @param ctx - A convex context capable of running actions.
+   * @param streamId - The ID of the stream.
+   * @param streamWriter - A function that generates chunks and writes them
+   * to the stream with the given `ActionStreamWriter`.
+   * @returns A promise that resolves when the streaming is complete.
+   * @example
+   * ```ts
+   * const streaming = new PersistentTextStreaming(api);
+   * const streamId = await streaming.createStream(ctx);
+   * await streaming.actionStream(ctx, streamId, async (ctx, id, append) => {
+   *   await append("Hello ");
+   *   await append("World!");
+   * });
+   * ```
+   */
+  async actionStream<A extends GenericActionCtx<GenericDataModel>>(
+    ctx: A,
+    streamId: StreamId,
+    streamWriter: ActionStreamWriter<A>
+  ) {
+    const streamState = await ctx.runQuery(this.component.lib.getStreamStatus, {
+      streamId,
+    });
+    if (streamState !== "pending") {
+      throw new Error("Stream was already started");
+    }
+
+    let pending = "";
+
+    const chunkAppender: ChunkAppender = async (text) => {
+      pending += text;
+      // write to the database periodically, like at the end of sentences
+      if (hasDelimeter(text)) {
+        await this.addChunk(ctx, streamId, pending, false);
+        pending = "";
+      }
+    };
+
+    try {
+      await streamWriter(ctx, streamId, chunkAppender);
+    } catch (e) {
+      await this.setStreamStatus(ctx, streamId, "error");
+      throw e;
+    }
+
+    // Success? Flush any last updates
+    await this.addChunk(ctx, streamId, pending, true);
+  }
+
+  /**
+   * Poll for stream chunks with configurable interval and timeout. This will
+   * continuously check for updates to the stream until it's complete or times out.
+   *
+   * @param ctx - A convex context capable of running queries.
+   * @param streamId - The ID of the stream to poll.
+   * @param options - Configuration for polling behavior.
+   * @returns A promise that resolves to the final stream body when complete.
+   * @example
+   * ```ts
+   * const streaming = new PersistentTextStreaming(api);
+   * const result = await streaming.getStream(ctx, streamId, {
+   *   pollInterval: 500,
+   *   timeout: 60000
+   * });
+   * console.log(result.text, result.status);
+   * ```
+   */
+  async getStream(
+    ctx: RunQueryCtx,
+    streamId: StreamId,
+    options: GetStreamOptions = {}
+  ): Promise<StreamBody> {
+    const { pollInterval = 1000, timeout = 30000 } = options;
+    const startTime = Date.now();
+
+    while (true) {
+      const streamBody = await this.getStreamBody(ctx, streamId);
+      
+      // If stream is complete (done, error, or timeout), return immediately
+      if (streamBody.status === "done" || streamBody.status === "error" || streamBody.status === "timeout") {
+        return streamBody;
+      }
+
+      // Check if we've exceeded the timeout
+      if (Date.now() - startTime > timeout) {
+        throw new Error(`Stream polling timed out after ${timeout}ms`);
+      }
+
+      // Wait for the poll interval before checking again
+      await new Promise(resolve => setTimeout(resolve, pollInterval));
+    }
   }
 
   // Internal helper -- add a chunk to the stream.
