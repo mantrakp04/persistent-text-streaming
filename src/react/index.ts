@@ -3,7 +3,7 @@
 /// React helpers for persistent text streaming.
 import { StreamStatus } from "../component/schema";
 import { useQuery } from "convex/react";
-import { StreamBody, StreamId } from "../client";
+import { StreamId } from "../client";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { FunctionReference } from "convex/server";
 
@@ -32,8 +32,7 @@ export function useStream(
   getPersistentBody: FunctionReference<
     "query",
     "public",
-    { streamId: string },
-    StreamBody
+    { streamId: string }
   >,
   streamUrl: URL,
   driven: boolean,
@@ -79,7 +78,7 @@ export function useStream(
     }
   }, [driven, streamId, setStreamEnded, streamStarted]);
 
-  const body = useMemo<StreamBody>(() => {
+  const body = useMemo(() => {
     // console.log(
     //   "body info p vs. s",
     //   persistentBody?.text?.length ?? 0,

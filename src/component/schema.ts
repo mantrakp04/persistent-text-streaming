@@ -16,6 +16,6 @@ export default defineSchema({
   }).index("byStatus", ["status"]),
   chunks: defineTable({
     streamId: v.id("streams"),
-    text: v.string(),
+    chunk: v.string(),
   }).index("byStream", ["streamId"]),
 });

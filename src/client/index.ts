@@ -12,24 +12,13 @@ import { StreamStatus } from "../component/schema";
 
 export type StreamId = string & { __isStreamId: true };
 export const StreamIdValidator = v.string();
-export type StreamBody = {
-  text: string;
-  status: StreamStatus;
-};
-
-export type ChunkAppender = (text: string) => Promise<void>;
-export type StreamWriter<A extends GenericActionCtx<GenericDataModel>> = (
-  ctx: A,
-  request: Request,
-  streamId: StreamId,
-  chunkAppender: ChunkAppender
-) => Promise<void>;
 
 export type ActionStreamWriter<A extends GenericActionCtx<GenericDataModel>> = (
   ctx: A,
   streamId: StreamId,
-  chunkAppender: ChunkAppender
 ) => Promise<void>;
+
+export type ChunkAppender = (chunk: string) => Promise<void>;
 
 export type GetStreamOptions = {
   pollInterval?: number; // milliseconds, default 1000
@@ -37,15 +26,18 @@ export type GetStreamOptions = {
 };
 
 // TODO -- make more flexible. # of bytes, etc?
-const hasDelimeter = (text: string) => {
-  return text.includes(".") || text.includes("!") || text.includes("?");
+const hasDelimeter = (chunk: string) => {
+  return chunk.includes(".") || chunk.includes("!") || chunk.includes("?");
 };
 
 // TODO -- some sort of wrapper with easy ergonomics for working with LLMs?
 export class PersistentTextStreaming {
   constructor(
     public component: UseApi<typeof api>,
-    public options?: object
+    public options: GetStreamOptions = {
+      pollInterval: 1000,
+      timeout: 30000,
+    }
   ) {}
 
   /**
@@ -72,7 +64,7 @@ export class PersistentTextStreaming {
   }
 
   /**
-   * Get the body of a stream. This will return the full text of the stream
+   * Get the body of a stream. This will return the full chunks of the stream
    * and the status of the stream.
    *
    * @param ctx - A convex context capable of running queries.
@@ -81,18 +73,21 @@ export class PersistentTextStreaming {
    * @example
    * ```ts
    * const streaming = new PersistentTextStreaming(api);
-   * const { text, status } = await streaming.getStreamBody(ctx, streamId);
+   * const { chunks, status } = await streaming.getStreamBody(ctx, streamId);
    * ```
    */
   async getStreamBody(
     ctx: RunQueryCtx,
     streamId: StreamId
-  ): Promise<StreamBody> {
-    const { text, status } = await ctx.runQuery(
-      this.component.lib.getStreamText,
+  ) {
+    const result = await ctx.runQuery(
+      this.component.lib.getStreamChunks,
       { streamId }
     );
-    return { text, status: status as StreamStatus };
+    if (!result) {
+      throw new Error("Stream not found");
+    }
+    return result;
   }
 
   /**
@@ -102,82 +97,96 @@ export class PersistentTextStreaming {
    * @param ctx - A convex context capable of running actions.
    * @param request - The HTTP request object.
    * @param streamId - The ID of the stream.
-   * @param streamWriter - A function that generates chunks and writes them
-   * to the stream with the given `StreamWriter`.
    * @returns A promise that resolves to an HTTP response. You may need to adjust
    * the headers of this response for CORS, etc.
    * @example
    * ```ts
    * const streaming = new PersistentTextStreaming(api);
    * const streamId = await streaming.createStream(ctx);
-   * const response = await streaming.stream(ctx, request, streamId, async (ctx, req, id, append) => {
-   *   await append("Hello ");
-   *   await append("World!");
-   * });
+   * const response = await streaming.stream(ctx, request, streamId);
    * ```
    */
-  async httpStream<A extends GenericActionCtx<GenericDataModel>>(
+  async stream<A extends GenericActionCtx<GenericDataModel>>(
     ctx: A,
     request: Request,
     streamId: StreamId,
-    streamWriter: StreamWriter<A>
   ) {
+    const { pollInterval = 1000, timeout = 30000 } = this.options;
+    const startTime = Date.now();
+
+    // Get initial chunks
+    const initialChunks = await ctx.runQuery(this.component.lib.getStreamChunks, {
+      streamId,
+    });
+    
+    let lastCreatedAt = initialChunks?.chunks[initialChunks.chunks.length - 1]?._creationTime;
+
     const streamState = await ctx.runQuery(this.component.lib.getStreamStatus, {
       streamId,
     });
-    if (streamState !== "pending") {
-      console.log("Stream was already started");
+    
+    if (streamState !== "pending" && streamState !== "streaming") {
       return new Response("", {
         status: 205,
       });
     }
+
     // Create a TransformStream to handle streaming data
     const { readable, writable } = new TransformStream();
-    let writer = writable.getWriter() as WritableStreamDefaultWriter<Uint8Array> | null;
+    const writer = writable.getWriter();
     const textEncoder = new TextEncoder();
-    let pending = "";
 
     const doStream = async () => {
-      const chunkAppender: ChunkAppender = async (text) => {
-        // write to this handler's response stream on every update
-        if (writer) {
-          try {
-            await writer.write(textEncoder.encode(text));
-          } catch (e) {
-            console.error("Error writing to stream", e);
-            console.error("Will skip writing to stream but continue database updates");
-            writer = null;
+      try {
+        // First, send initial chunks if any
+        if (initialChunks?.chunks) {
+          for (const chunk of initialChunks.chunks) {
+            await writer.write(textEncoder.encode(chunk.chunk));
           }
         }
-        pending += text;
-        // write to the database periodically, like at the end of sentences
-        if (hasDelimeter(text)) {
-          await this.addChunk(ctx, streamId, pending, false);
-          pending = "";
+
+        // Poll for new chunks
+        while (true) {
+          const currentTime = Date.now();
+          
+          // Check timeout
+          if (currentTime - startTime > timeout) {
+            console.log("Stream timeout reached");
+            break;
+          }
+
+          // Get new chunks since last poll
+          const result = await ctx.runQuery(this.component.lib.getNewStreamChunks, {
+            streamId,
+            lastCreatedAt,
+          });
+
+          // Send new chunks
+          for (const chunk of result.chunks) {
+            await writer.write(textEncoder.encode(chunk.chunk));
+            lastCreatedAt = chunk._creationTime;
+          }
+
+          // Check if stream is complete
+          if (result.status === "done" || result.status === "error" || result.status === "timeout") {
+            console.log(`Stream completed with status: ${result.status}`);
+            break;
+          }
+
+          // Wait for next poll
+          await new Promise(resolve => setTimeout(resolve, pollInterval));
         }
-      };
-      try {
-        await streamWriter(ctx, request, streamId, chunkAppender);
       } catch (e) {
-        await this.setStreamStatus(ctx, streamId, "error");
-        if (writer) {
-          await writer.close();
-        }
-        throw e;
-      }
-
-      // Success? Flush any last updates
-      await this.addChunk(ctx, streamId, pending, true);
-
-      if (writer) {
+        console.error("Error in stream polling:", e);
+      } finally {
         await writer.close();
       }
     };
 
-    // Kick off the streaming, but don't await it.
+    // Start streaming in background
     void doStream();
 
-    // Send the readable back to the browser
+    // Return the readable stream
     return new Response(readable);
   }
 
@@ -195,9 +204,8 @@ export class PersistentTextStreaming {
    * ```ts
    * const streaming = new PersistentTextStreaming(api);
    * const streamId = await streaming.createStream(ctx);
-   * await streaming.actionStream(ctx, streamId, async (ctx, id, append) => {
-   *   await append("Hello ");
-   *   await append("World!");
+   * await streaming.actionStream(ctx, streamId, async (ctx, id) => {
+   *   // Your streaming logic here
    * });
    * ```
    */
@@ -215,17 +223,17 @@ export class PersistentTextStreaming {
 
     let pending = "";
 
-    const chunkAppender: ChunkAppender = async (text) => {
-      pending += text;
+    const chunkAppender: ChunkAppender = async (chunk: string) => {
+      pending += chunk;
       // write to the database periodically, like at the end of sentences
-      if (hasDelimeter(text)) {
+      if (hasDelimeter(chunk)) {
         await this.addChunk(ctx, streamId, pending, false);
         pending = "";
       }
     };
 
     try {
-      await streamWriter(ctx, streamId, chunkAppender);
+      await streamWriter(ctx, streamId);
     } catch (e) {
       await this.setStreamStatus(ctx, streamId, "error");
       throw e;
@@ -235,60 +243,16 @@ export class PersistentTextStreaming {
     await this.addChunk(ctx, streamId, pending, true);
   }
 
-  /**
-   * Poll for stream chunks with configurable interval and timeout. This will
-   * continuously check for updates to the stream until it's complete or times out.
-   *
-   * @param ctx - A convex context capable of running queries.
-   * @param streamId - The ID of the stream to poll.
-   * @param options - Configuration for polling behavior.
-   * @returns A promise that resolves to the final stream body when complete.
-   * @example
-   * ```ts
-   * const streaming = new PersistentTextStreaming(api);
-   * const result = await streaming.getStream(ctx, streamId, {
-   *   pollInterval: 500,
-   *   timeout: 60000
-   * });
-   * console.log(result.text, result.status);
-   * ```
-   */
-  async getStream(
-    ctx: RunQueryCtx,
-    streamId: StreamId,
-    options: GetStreamOptions = {}
-  ): Promise<StreamBody> {
-    const { pollInterval = 1000, timeout = 30000 } = options;
-    const startTime = Date.now();
-
-    while (true) {
-      const streamBody = await this.getStreamBody(ctx, streamId);
-      
-      // If stream is complete (done, error, or timeout), return immediately
-      if (streamBody.status === "done" || streamBody.status === "error" || streamBody.status === "timeout") {
-        return streamBody;
-      }
-
-      // Check if we've exceeded the timeout
-      if (Date.now() - startTime > timeout) {
-        throw new Error(`Stream polling timed out after ${timeout}ms`);
-      }
-
-      // Wait for the poll interval before checking again
-      await new Promise(resolve => setTimeout(resolve, pollInterval));
-    }
-  }
-
   // Internal helper -- add a chunk to the stream.
   private async addChunk(
     ctx: RunMutationCtx,
     streamId: StreamId,
-    text: string,
+    chunk: string,
     final: boolean
   ) {
     await ctx.runMutation(this.component.lib.addChunk, {
       streamId,
-      text,
+      chunk,
       final,
     });
   }

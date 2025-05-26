@@ -1,6 +1,8 @@
-import { v } from "convex/values";
+import { v, Value } from "convex/values";
 import { internalMutation, mutation, query } from "./_generated/server";
 import { streamStatusValidator } from "./schema";
+import { ExpressionOrValue } from "convex/server";
+import { Doc } from "./_generated/dataModel";
 
 // Create a new stream with zero chunks.
 export const createStream = mutation({
@@ -19,7 +21,7 @@ export const createStream = mutation({
 export const addChunk = mutation({
   args: {
     streamId: v.id("streams"),
-    text: v.string(),
+    chunk: v.string(),
     final: v.boolean(),
   },
   handler: async (ctx, args) => {
@@ -36,7 +38,7 @@ export const addChunk = mutation({
     }
     await ctx.db.insert("chunks", {
       streamId: args.streamId,
-      text: args.text,
+      chunk: args.chunk,
     });
     if (args.final) {
       await ctx.db.patch(args.streamId, {
@@ -89,31 +91,47 @@ export const getStreamStatus = query({
   },
 });
 
-// Get the full text of a stream.
-// Involves concatenating all the chunks.
-export const getStreamText = query({
+export const getStreamChunks = query({
   args: {
     streamId: v.id("streams"),
   },
-  returns: v.object({
-    text: v.string(),
-    status: streamStatusValidator,
-  }),
   handler: async (ctx, args) => {
     const stream = await ctx.db.get(args.streamId);
     if (!stream) {
       throw new Error("Stream not found");
     }
-    let text = "";
+    
     if (stream.status !== "pending") {
       const chunks = await ctx.db
         .query("chunks")
         .withIndex("byStream", (q) => q.eq("streamId", args.streamId))
         .collect();
-      text = chunks.map((chunk) => chunk.text).join("");
+
+      return {
+        chunks: chunks as Doc<"chunks">[],
+        status: stream.status,
+      };
     }
+  },
+});
+
+export const getNewStreamChunks = query({
+  args: {
+    streamId: v.id("streams"),
+    lastCreatedAt: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const stream = await ctx.db.get(args.streamId);
+    if (!stream) {
+      throw new Error("Stream not found");
+    }
+    const chunks = await ctx.db
+      .query("chunks")
+      .withIndex("byStream", (q) => q.eq("streamId", args.streamId))
+      .filter((q) => q.gt("_creationTime", args.lastCreatedAt ?? 0 as ExpressionOrValue<Value>))
+      .collect();
     return {
-      text,
+      chunks,
       status: stream.status,
     };
   },
